@@ -1,42 +1,9 @@
-# execution profile
-# from cassandra import ConsistencyLevel
-# from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
-# from cassandra.policies import WhiteListRoundRobinPolicy, DowngradingConsistencyRetryPolicy
-# from cassandra.query import tuple_factory
-
-
-
-# profile = ExecutionProfile(
-#     load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.1']),
-#     retry_policy=DowngradingConsistencyRetryPolicy(),
-#     consistency_level=ConsistencyLevel.LOCAL_QUORUM,
-#     serial_consistency_level=ConsistencyLevel.LOCAL_SERIAL,
-#     request_timeout=15,
-#     row_factory=tuple_factory
-# )
-# cluster = Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: profile})
-# session = cluster.connect('covid19')
-
-# print(session.execute("SELECT release_version FROM system.local").one())
-
-
-
-# # execution profile
-#     # from cassandra.cluster import Cluster
-#     # cluster = Cluster()
-#     # session = cluster.connect()
-# local_query = 'SELECT rpc_address FROM system.local'
-# for _ in cluster.metadata.all_hosts():
-#     print(session.execute(local_query)[0])
-
-
-
-# Model
 from cassandra.cqlengine import columns
 from cassandra.cqlengine.models import Model
 from cassandra.cqlengine.management import sync_table, create_keyspace_simple
 from cassandra.cqlengine import connection
 
+import arrow
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -52,7 +19,8 @@ class CovidModel(Model):
     __table_name__ = 'covid19data'
 
     # Index(['Province/State', 'Country/Region', 'Last Update', 'Confirmed', 'Deaths', 'Recovered'], dtype='object')
-    province_or_state = columns.Text(primary_key=True)
+    id = columns.Text(primary_key=True)
+    province_or_state = columns.Text()
     country_or_region = columns.Text()
     last_update       = columns.DateTime()
     confirmed         = columns.Integer()
@@ -64,29 +32,89 @@ sync_table(CovidModel)
 
 print('Already in database', CovidModel.objects.count())
 
-# analysis part
-raw_df = pd.read_csv('COVID-19/csse_covid_19_data/csse_covid_19_daily_reports/01-22-2020.csv')
 
-covid_data_df = raw_df.rename(columns={
-    'Province/State': 'province_or_state',
-    'Country/Region': 'country_or_region',
-    'Last Update': 'last_update',
-    'Confirmed': 'confirmed',
-    'Deaths': 'deaths',
-    'Recovered': 'recovered'
-})
+import glob, os
 
-# Inserting each row entry in the table CovidModel
-for row in covid_data_df.iterrows():
-    row_dict = row[1].to_dict()
-    
-    row_dict['confirmed'] = 0 if pd.isna(row_dict['confirmed']) else int(row_dict['confirmed'])
-    row_dict['deaths'] = 0 if pd.isna(row_dict['deaths']) else int(row_dict['deaths'])
-    row_dict['recovered'] = 0 if pd.isna(row_dict['recovered']) else int(row_dict['recovered'])
+CURRENT_DIRECTORY = os.path.dirname(os.path.realpath(__file__))
 
+CSV_INPUT_DIRECTORY = os.path.join(CURRENT_DIRECTORY, "./COVID-19/csse_covid_19_data/csse_covid_19_daily_reports/")
+os.chdir(CSV_INPUT_DIRECTORY)
+
+
+def parse_datetime_string(datetime_str):
     try:
-        CovidModel.create(**row_dict)
-    except TypeError as e:
-        print(row_dict)
-        raise e
-        continue
+        return arrow.get(datetime_str).datetime
+    except arrow.parser.ParserError:
+        pass
+
+    SUPPORTED_FORMATS =  [
+        'M/D/YYYY HH:mm',
+        'M/D/YY HH:mm',
+        'M/D/YYYY H:mm',
+        'M/D/YY H:mm',
+    ]
+
+    for format in SUPPORTED_FORMATS:
+        try:
+            return arrow.get(datetime_str, format).datetime 
+        except arrow.parser.ParserMatchError:
+            continue
+    
+    raise ValueError(f'Could not parse datetime string: {datetime_str}')
+    
+
+def get_column_rename_dict(given_column_names):
+    all_mappings = {
+        'province_or_state': ['Province/State', 'Province_State'],
+        'country_or_region': ['Country/Region', 'Country_Region'],
+        'last_update': ['Last Update', 'Last_Update'],
+        'confirmed': ['Confirmed',],
+        'deaths': ['Deaths',],
+        'recovered': ['Recovered',],
+    }
+
+    mapping_dict_for_current = {}
+    for desired_column_name, possible_col_headers in all_mappings.items():
+        for col_header in possible_col_headers:
+            if col_header in given_column_names:
+                mapping_dict_for_current[col_header] = desired_column_name
+                break
+    
+    missing_keys = set(all_mappings.keys()) - set(mapping_dict_for_current.values())
+    if missing_keys:
+        raise KeyError(f'Did not find anything for : {missing_keys}', given_column_names)
+    
+    return mapping_dict_for_current
+
+
+
+for filename in glob.glob("*.csv"):
+    csv_filepath = os.path.join(CSV_INPUT_DIRECTORY, filename)
+    print(csv_filepath)
+
+    # analysis part
+    raw_df = pd.read_csv(csv_filepath)
+
+    covid_data_df = raw_df.rename(columns=get_column_rename_dict(list(raw_df.columns.values)))
+
+    # Inserting each row entry in the table CovidModel
+    for row_index, row in covid_data_df.iterrows():
+        data = dict()    
+        
+        data['country_or_region'] = row.country_or_region.strip()
+        data['province_or_state'] = '' if pd.isna(row.province_or_state) else row.province_or_state.strip()
+        
+        data['last_update'] = parse_datetime_string(row.last_update)
+        
+        data['confirmed'] = 0 if pd.isna(row.confirmed) else int(row.confirmed)
+        data['deaths'] = 0 if pd.isna(row.deaths) else int(row.deaths)
+        data['recovered'] = 0 if pd.isna(row.recovered) else int(row.recovered)
+
+        data['id'] = '__'.join([data['country_or_region'], data['province_or_state'], data['last_update'].isoformat()])
+
+        try:
+            CovidModel.create(**data)
+        except Exception as e:
+            print(row_dict)
+            raise e
+            continue
